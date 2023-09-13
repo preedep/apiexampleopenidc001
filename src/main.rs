@@ -1,15 +1,13 @@
-use std::pin::pin;
 use actix_cors::Cors;
-use actix_web::{App, get, http, HttpRequest, HttpResponse, HttpServer, Responder, web};
 use actix_web::http::header;
 use actix_web::web::Data;
+use actix_web::{ web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use actix_web_httpauth::extractors::bearer;
 use actix_web_httpauth::extractors::bearer::BearerAuth;
-use jsonwebtoken::{Algorithm, decode, decode_header, DecodingKey, Validation};
+use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-
 
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -125,7 +123,8 @@ pub struct Config {
     pub client_id: String,
     pub client_secret: String,
     pub open_id_config: Option<OpenIDConfigurationV2>,
-    pub jwks: Option<JWKS>
+    pub jwks: Option<JWKS>,
+    pub api_permission_scope: Option<String>,
 }
 
 impl Config {
@@ -148,30 +147,48 @@ impl Config {
             client_secret,
             open_id_config: None,
             jwks: None,
+            api_permission_scope: None,
         }
     }
 }
-async fn ping(request: HttpRequest,data: web::Data<Config>,auth: BearerAuth) -> impl Responder {
+async fn ping(request: HttpRequest, data: web::Data<Config>, auth: BearerAuth) -> impl Responder {
     debug!("Request was sent at {:#?}", auth.token());
     let header = decode_header(&auth.token());
+    let api_permission_scope = data.api_permission_scope.clone().unwrap();
+    let pos_scope = api_permission_scope.rfind("/").unwrap_or(0);
+    debug!("pos_scope : {}",pos_scope);
+
+    let aud_api_permission = &api_permission_scope[..pos_scope];
+    let scope = api_permission_scope.replace(format!("{}/",aud_api_permission).as_str(),"");
+
+    debug!("Aud = {} , Scope = {}",aud_api_permission,scope);
+
     match header {
-        Ok(h) => { ;
-            debug!("Header : {:#?}",h);
+        Ok(h) => {
+            debug!("Header : {:#?}", h);
             let jwks = data.jwks.clone().unwrap();
             for jwks_item in jwks.keys.unwrap() {
-                if jwks_item.kid.unwrap().eq(h.clone().kid.unwrap().as_str()){
+                if jwks_item.kid.unwrap().eq(h.clone().kid.unwrap().as_str()) {
                     // `token` is a struct with 2 fields: `header` and `claims` where `claims` is your own struct.
-                    let token = decode::<AccessToken>(&auth.token(),
-                                                      &DecodingKey::from_rsa_components(
-                                                          jwks_item.n.clone().unwrap().as_str(),
-                                                          jwks_item.e.clone().unwrap().as_str()
-                                                      ).unwrap(),
-                                                      &Validation::new(Algorithm::RS256));
+                    let token = decode::<AccessToken>(
+                        &auth.token(),
+                        &DecodingKey::from_rsa_components(
+                            jwks_item.n.clone().unwrap().as_str(),
+                            jwks_item.e.clone().unwrap().as_str(),
+                        )
+                        .unwrap(),
+                        &Validation::new(Algorithm::RS256),
+                    );
                     return match token {
                         Ok(token) => {
-                            debug!("{:#?}",token);
-                            if token.claims.aud.map(|aud|aud.eq("api://81dd62c1-4209-4f24-bd81-99912098a77f")).unwrap(){
-                                if token.claims.scp.map(|scp|scp.eq("Ping.All")).unwrap(){
+                            debug!("{:#?}", token);
+                            if token
+                                .claims
+                                .aud
+                                .map(|aud| aud.eq(aud_api_permission))
+                                .unwrap()
+                            {
+                                if token.claims.scp.map(|scp| scp.eq(scope.as_str())).unwrap() {
                                     return HttpResponse::Ok().json(json!({
                                          "message":"pong"
                                     }));
@@ -182,12 +199,12 @@ async fn ping(request: HttpRequest,data: web::Data<Config>,auth: BearerAuth) -> 
                             }))
                         }
                         Err(e) => {
-                            error!("Decode Token {}",e);
+                            error!("Decode Token {}", e);
                             HttpResponse::Ok().json(json!({
                                 "message":format!("error {}",e)
                             }))
                         }
-                    }
+                    };
                 }
             }
             //request.headers().geat("authorization");
@@ -219,6 +236,8 @@ async fn main() -> std::io::Result<()> {
     let client_id = std::env::var("CLIENT_ID").unwrap_or("".to_string());
     let client_secret = std::env::var("CLIENT_SECRET").unwrap_or("".to_string());
     let cookie_ssl = std::env::var("COOKIE_SSL").unwrap_or("false".to_string());
+    let api_permission_scope = std::env::var("API_PERMISSION_SCOPE")
+        .unwrap_or("api://81dd62c1-4209-4f24-bd81-99912098a77f/Ping.All".to_string());
 
     let use_cookie_ssl: bool = match cookie_ssl.as_str() {
         "false" => false,
@@ -235,6 +254,7 @@ async fn main() -> std::io::Result<()> {
         client_id,
         client_secret,
     );
+    config.api_permission_scope = Some(api_permission_scope);
     //
     // Get azure ad meta data
     //
@@ -254,13 +274,10 @@ async fn main() -> std::io::Result<()> {
             debug!("Meta data : {:#?}", cnf);
             config.open_id_config = Some(cnf);
             let jwks_uri = config.open_id_config.clone().unwrap().jwks_uri.unwrap();
-            let jwks_items = reqwest::get(jwks_uri)
-                .await
-                .unwrap()
-                .json::<JWKS>().await;
+            let jwks_items = reqwest::get(jwks_uri).await.unwrap().json::<JWKS>().await;
             match jwks_items {
                 Ok(jwks) => {
-                    debug!("JWKS = {:#?}",jwks);
+                    debug!("JWKS = {:#?}", jwks);
                     config.jwks = Some(jwks.clone());
                 }
                 Err(e) => {
@@ -276,23 +293,20 @@ async fn main() -> std::io::Result<()> {
         // move counter into the closure
         App::new()
             .app_data(Data::new(config.clone()))
-            .app_data(
-                bearer::Config::default()
-                    .scope("Ping.All")
-            )
+            .app_data(bearer::Config::default().scope("Ping.All"))
             .wrap(
                 Cors::default()
                     .allow_any_origin()
                     .allowed_methods(vec!["GET", "POST"])
-                    .allowed_headers(vec![header::AUTHORIZATION, header::ACCEPT])
+                    .allowed_headers(vec![header::AUTHORIZATION, header::ACCEPT]),
             )
             .service(
-                web::resource("/ping").
-                    route(web::get().to(ping))
-                    .route(web::post().to(ping))
-        )
+                web::resource("/ping")
+                    .route(web::get().to(ping))
+                    .route(web::post().to(ping)),
+            )
     })
-        .bind(("0.0.0.0", 8081))?
-        .run()
-        .await
+    .bind(("0.0.0.0", 8081))?
+    .run()
+    .await
 }
