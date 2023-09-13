@@ -6,7 +6,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+actix-cors = "0.6.4"
 actix-web = "4"
+actix-web-httpauth = "0.8"
 jsonwebtoken =  {version = "8.3" , features = ["use_pem"]}
 log = "0.4"
 pretty_env_logger = "0.5"

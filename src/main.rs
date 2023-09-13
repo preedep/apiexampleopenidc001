@@ -1,10 +1,47 @@
-use actix_web::{App, get, HttpRequest, HttpResponse, HttpServer, Responder, web};
+use std::pin::pin;
+use actix_cors::Cors;
+use actix_web::{App, get, http, HttpRequest, HttpResponse, HttpServer, Responder, web};
 use actix_web::http::header;
 use actix_web::web::Data;
+use actix_web_httpauth::extractors::bearer;
+use actix_web_httpauth::extractors::bearer::BearerAuth;
+use jsonwebtoken::{Algorithm, decode, decode_header, DecodingKey, Validation};
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+
+#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccessToken {
+    pub aud: Option<String>,
+    pub iss: Option<String>,
+    pub iat: Option<i64>,
+    pub nbf: Option<i64>,
+    pub exp: Option<i64>,
+    pub acr: Option<String>,
+    pub aio: Option<String>,
+    pub amr: Option<Vec<String>>,
+    pub appid: Option<String>,
+    pub appidacr: Option<String>,
+    pub email: Option<String>,
+    #[serde(rename = "family_name")]
+    pub family_name: Option<String>,
+    #[serde(rename = "given_name")]
+    pub given_name: Option<String>,
+    pub idp: Option<String>,
+    pub ipaddr: Option<String>,
+    pub name: Option<String>,
+    pub oid: Option<String>,
+    pub rh: Option<String>,
+    pub scp: Option<String>,
+    pub sub: Option<String>,
+    pub tid: Option<String>,
+    #[serde(rename = "unique_name")]
+    pub unique_name: Option<String>,
+    pub uti: Option<String>,
+    pub ver: Option<String>,
+}
 
 ///
 /// Open ID Configuration
@@ -114,11 +151,57 @@ impl Config {
         }
     }
 }
-async fn ping(request: HttpRequest,data: web::Data<Config>) -> impl Responder {
-    debug!("Request was sent at {:#?}", request.headers());
-    HttpResponse::Ok().json(json!({
-        "message":"pong"
-    }))
+async fn ping(request: HttpRequest,data: web::Data<Config>,auth: BearerAuth) -> impl Responder {
+    debug!("Request was sent at {:#?}", auth.token());
+    let header = decode_header(&auth.token());
+    match header {
+        Ok(h) => { ;
+            debug!("Header : {:#?}",h);
+            let jwks = data.jwks.clone().unwrap();
+            for jwks_item in jwks.keys.unwrap() {
+                if jwks_item.kid.unwrap().eq(h.clone().kid.unwrap().as_str()){
+                    // `token` is a struct with 2 fields: `header` and `claims` where `claims` is your own struct.
+                    let token = decode::<AccessToken>(&auth.token(),
+                                                      &DecodingKey::from_rsa_components(
+                                                          jwks_item.n.clone().unwrap().as_str(),
+                                                          jwks_item.e.clone().unwrap().as_str()
+                                                      ).unwrap(),
+                                                      &Validation::new(Algorithm::RS256));
+                    return match token {
+                        Ok(token) => {
+                            debug!("{:#?}",token);
+                            if token.claims.aud.map(|aud|aud.eq("api://81dd62c1-4209-4f24-bd81-99912098a77f")).unwrap(){
+                                if token.claims.scp.map(|scp|scp.eq("Ping.All")).unwrap(){
+                                    return HttpResponse::Ok().json(json!({
+                                         "message":"pong"
+                                    }));
+                                }
+                            }
+                            HttpResponse::Ok().json(json!({
+                                "message":"Access Token Invalid"
+                            }))
+                        }
+                        Err(e) => {
+                            error!("Decode Token {}",e);
+                            HttpResponse::Ok().json(json!({
+                                "message":format!("error {}",e)
+                            }))
+                        }
+                    }
+                }
+            }
+            //request.headers().geat("authorization");
+            return HttpResponse::Ok().json(json!({
+                "message":"pong"
+            }));
+        }
+        Err(e) => {
+            //request.headers().get("authorization");
+            HttpResponse::Ok().json(json!({
+                 "message":format!("{}",e)
+            }))
+        }
+    }
 }
 
 #[actix_web::main]
@@ -193,7 +276,21 @@ async fn main() -> std::io::Result<()> {
         // move counter into the closure
         App::new()
             .app_data(Data::new(config.clone()))
-            .route("/ping", web::get().to(ping))
+            .app_data(
+                bearer::Config::default()
+                    .scope("Ping.All")
+            )
+            .wrap(
+                Cors::default()
+                    .allow_any_origin()
+                    .allowed_methods(vec!["GET", "POST"])
+                    .allowed_headers(vec![header::AUTHORIZATION, header::ACCEPT])
+            )
+            .service(
+                web::resource("/ping").
+                    route(web::get().to(ping))
+                    .route(web::post().to(ping))
+        )
     })
         .bind(("0.0.0.0", 8081))?
         .run()
